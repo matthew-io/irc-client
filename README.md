@@ -1,0 +1,1 @@
+## Multithreaded Rust IRC client (with GUI)
