@@ -4,6 +4,7 @@ use std::{
     net::{TcpListener, TcpStream},
     sync::{Arc, Mutex},
     fs,
+    time::Duration,
     thread,
 };
 use bcrypt::{hash, DEFAULT_COST, verify};
@@ -98,7 +99,6 @@ fn login_user(
         })? {
             *nickname = username.clone();
 
-            // Update the SharedClients map
             let mut clients = clients.lock().unwrap();
             clients.insert(username.clone(), Arc::new(Mutex::new(stream.try_clone()?)));
 
@@ -130,22 +130,17 @@ fn handle_stats(
 
 fn join_channel(
     nickname: &str,
-    message: &str,
+    channel_name: &str,
     channels: &SharedChannels,
     stream: &mut TcpStream,
 ) -> Result<(), std::io::Error> {
-    let parts: Vec<&str> = message.splitn(2, ' ').collect();
-    if parts.len() != 2 {
-        return stream.write_all(b"Invalid JOIN command format.\r\n").map(|_| ());
-    }
-
-    let channel_name = parts[1].to_string();
     let mut channels = channels.lock().unwrap();
-    let channel = channels.entry(channel_name.clone()).or_insert(Vec::new());
+    let channel = channels.entry(channel_name.to_string()).or_insert(Vec::new());
 
     if !channel.contains(&nickname.to_string()) {
         channel.push(nickname.to_string());
-        stream.write_all(format!("Joined channel {}\r\n", channel_name).as_bytes())?;
+        let msg = format!("Joined channel {}\r\n", channel_name);
+        stream.write_all(msg.as_bytes())?;
         log::info!("{} joined channel {}", nickname, channel_name);
     }
     Ok(())
@@ -153,18 +148,12 @@ fn join_channel(
 
 fn send_message(
     nickname: &str,
-    message: &str,
+    target: &str,
+    msg: &str,
     clients: &SharedClients,
     channels: &SharedChannels,
     stream: &mut TcpStream,
 ) -> Result<(), std::io::Error> {
-    let parts: Vec<&str> = message.splitn(3, ' ').collect();
-    if parts.len() != 3 {
-        return stream.write_all(b"Invalid PRIVMSG command format.\r\n").map(|_| ());
-    }
-
-    let target = parts[1];
-    let msg = parts[2];
     let clients = clients.lock().unwrap();
     let channels = channels.lock().unwrap();
 
@@ -180,42 +169,122 @@ fn send_message(
         } else {
             stream.write_all(b"Channel not found.\r\n")?;
         }
-    } else if let Some(client) = clients.get(target) {
-        let mut client = client.lock().unwrap();
-        let private_message = format!("{}: {}\r\n", nickname, msg);
-        client.write_all(private_message.as_bytes())?;
     } else {
-        stream.write_all(b"User not found.\r\n")?;
+        if let Some(client) = clients.get(target) {
+            let mut client = client.lock().unwrap();
+            let private_message = format!("(Private) {}: {}\r\n", nickname, msg);
+            client.write_all(private_message.as_bytes())?;
+        } else {
+            stream.write_all(b"User not found.\r\n")?;
+        }
     }
     Ok(())
 }
 
 fn set_nickname(
     nickname: &mut String,
-    message: &str,
+    new_nickname: &str,
     clients: &SharedClients,
     stream: &mut TcpStream,
 ) -> Result<(), std::io::Error> {
-    let parts: Vec<&str> = message.splitn(2, ' ').collect();
-    if parts.len() != 2 {
-        return stream.write_all(b"Usage: NICK <name>\r\n").map(|_| ());
-    }
-
-    let new_nickname = parts[1].to_string();
-
-    // Update the clients map
-    let mut clients = clients.lock().unwrap();
-    if clients.contains_key(&new_nickname) {
+    let mut clients_map = clients.lock().unwrap();
+    if clients_map.contains_key(new_nickname) {
         stream.write_all(b"Nickname already in use.\r\n").map(|_| ())
     } else {
-        *nickname = new_nickname.clone();
-        clients.insert(new_nickname.clone(), Arc::new(Mutex::new(stream.try_clone()?)));
-        stream.write_all(format!("Nickname set to {}\r\n", new_nickname).as_bytes())?;
+        *nickname = new_nickname.to_string();
+        clients_map.insert(new_nickname.to_string(), Arc::new(Mutex::new(stream.try_clone()?)));
+        let resp = format!("Nickname set to {}\r\n", new_nickname);
+        stream.write_all(resp.as_bytes())?;
         log::info!("Client set nickname to {}", new_nickname);
         Ok(())
     }
 }
 
+fn parse_command(
+    message: &str,
+    nickname: &mut String,
+    stream: &mut TcpStream,
+    clients: &SharedClients,
+    channels: &SharedChannels,
+    users: &SharedUsers,
+) -> Result<(), std::io::Error> {
+    let is_logged_in = !nickname.is_empty();
+
+    let trimmed = message.trim_start_matches('/');
+    let mut parts = trimmed.splitn(2, ' ');
+    let command_part = parts.next().unwrap_or("").to_uppercase();
+    let rest = parts.next().unwrap_or("").trim();
+
+    match command_part.as_str() {
+        "REGISTER" => register_user(message, users, stream),
+        "LOGIN" => login_user(message, users, clients, stream, nickname),
+        "NICK" => {
+            if !is_logged_in {
+                stream.write_all(b"Please log in first.\r\n")?;
+                return Ok(());
+            }
+            let cmd_parts: Vec<&str> = message.splitn(2, ' ').collect();
+            if cmd_parts.len() != 2 {
+                return stream.write_all(b"Usage: NICK <name>\r\n").map(|_| ());
+            }
+            set_nickname(nickname, cmd_parts[1], clients, stream)
+        }
+        "STATS" => {
+            if !is_logged_in {
+                stream.write_all(b"Please log in first.\r\n")?;
+                return Ok(());
+            }
+            handle_stats(clients, channels, stream)
+        }
+        "JOIN" => {
+            if !is_logged_in {
+                stream.write_all(b"Please log in first.\r\n")?;
+                return Ok(());
+            }
+            if rest.is_empty() {
+                stream.write_all(b"Usage: JOIN #channel\r\n")?;
+                return Ok(());
+            }
+            join_channel(nickname, rest, channels, stream)
+        }
+        "MSG" => {
+            if !is_logged_in {
+                stream.write_all(b"Please log in first.\r\n")?;
+                return Ok(());
+            }
+
+            let cmd_parts: Vec<&str> = trimmed.splitn(3, ' ').collect();
+           
+            if cmd_parts.len() != 3 {
+                return stream.write_all(b"Usage: /msg <target> <message>\r\n").map(|_| ());
+            }
+            let target = cmd_parts[1];
+            let msg = cmd_parts[2];
+            send_message(nickname, target, msg, clients, channels, stream)
+        }
+        "PRIVMSG" => {
+            if !is_logged_in {
+                stream.write_all(b"Please log in first.\r\n")?;
+                return Ok(());
+            }
+            let cmd_parts: Vec<&str> = trimmed.splitn(3, ' ').collect();
+            if cmd_parts.len() != 3 {
+                return stream.write_all(b"Usage: PRIVMSG <target> <message>\r\n").map(|_| ());
+            }
+            let target = cmd_parts[1];
+            let msg = cmd_parts[2];
+            send_message(nickname, target, msg, clients, channels, stream)
+        }
+        _ => {
+            if !is_logged_in {
+                stream.write_all(b"Please log in first.\r\n")?;
+            } else {
+                stream.write_all(b"Unknown command.\r\n")?;
+            }
+            Ok(())
+        }
+    }
+}
 
 fn handle_client(
     mut stream: TcpStream,
@@ -223,15 +292,14 @@ fn handle_client(
     channels: SharedChannels,
     users: SharedUsers,
 ) {
-    let mut nickname = String::new(); // Local nickname for this client
+    let mut nickname = String::new();
     let mut buffer = [0; 512];
 
-    if let Err(e) = stream.write_all(b"Welcome to the IRC server! Use REGISTER or LOGIN.\r\n") {
+    if let Err(e) = stream.write_all(b"Welcome to the IRC server! Use REGISTER <u> <p> or LOGIN <u> <p>.\r\n") {
         log::error!("Failed to send welcome message: {}", e);
         return;
     }
 
-    // Loop for handling client messages
     loop {
         match stream.read(&mut buffer) {
             Ok(0) => {
@@ -240,27 +308,18 @@ fn handle_client(
             }
             Ok(bytes) => {
                 let message = String::from_utf8_lossy(&buffer[..bytes]).trim().to_string();
-                let result = if message.starts_with("REGISTER") {
-                    register_user(&message, &users, &mut stream)
-                } else if message.starts_with("LOGIN") {
-                    login_user(&message, &users, &clients, &mut stream, &mut nickname)
-                } else if message.starts_with("NICK") {
-                    set_nickname(&mut nickname, &message, &clients, &mut stream)
-                } else if message.starts_with("/STATS") {
-                    handle_stats(&clients, &channels, &mut stream)
-                } else if !nickname.is_empty() {
-                    if message.starts_with("JOIN") {
-                        join_channel(&nickname, &message, &channels, &mut stream)
-                    } else if message.starts_with("PRIVMSG") {
-                        send_message(&nickname, &message, &clients, &channels, &mut stream)
-                    } else {
-                        stream.write_all(b"Unknown command.\r\n").map(|_| ())
-                    }
-                } else {
-                    stream.write_all(b"Please log in first.\r\n").map(|_| ())
-                };
-                
+                if message.is_empty() {
+                    continue; 
+                }
 
+                let result = parse_command(
+                    &message,
+                    &mut nickname,
+                    &mut stream,
+                    &clients,
+                    &channels,
+                    &users,
+                );
                 if let Err(e) = result {
                     log::error!("Error handling message: {}", e);
                 }
@@ -270,6 +329,7 @@ fn handle_client(
                 break;
             }
         }
+        thread::sleep(Duration::from_millis(10));
     }
 }
 
